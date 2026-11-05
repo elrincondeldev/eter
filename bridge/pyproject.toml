@@ -1,0 +1,22 @@
+[project]
+name = "eter"
+version = "0.0.0"
+description = "Bridge between radio nodes and AI agents"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest", "ruff", "mypy"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["eter_core", "eter_mcp", "eter_cli", "eter_api", "eter_sim"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+strict = true
