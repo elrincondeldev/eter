@@ -1,37 +1,39 @@
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
-
-node_modules
-dist
-dist-ssr
-*.local
-
-# Editor directories and files
+# OS / editors
+.DS_Store
+.idea
+*.sw?
 .vscode/*
 !.vscode/extensions.json
-.idea
-.DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
 
-internal_files/*
-.env
-
-# Large example files
-public/examples/toy_packaging.json
+# Claude Code: keep shared project skills/commands, ignore personal settings
 .claude
-.vscode
 CLAUDE.md
-test-results
-docs/deepwiki
-tmp
 PROPOSAL.md
+skills-lock.json
+
+# Firmware (PlatformIO)
+firmware/.pio/
+
+# Bridge (Python / uv)
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Local data and secrets
+*.db
+*.sqlite
+*.log
+.env
+*.local
+
+# Private / scratch
+internal_files/
+docs/deepwiki/
+tmp/
+test-results/
