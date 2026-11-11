@@ -4,7 +4,7 @@ An open-source harness that gives AI agents access to the radio spectrum through
 
 A **node** (reference: ESP32-S3 + CC1101 433 MHz) captures signals. A **bridge** (Python) decodes and stores them and exposes them through MCP, a CLI, a library and an optional REST API.
 
-> Status: pre-development, Phase 0 (setup).
+> Status: pre-development. Phase 1 (CC1101 wiring and live RSSI) done; next is Phase 2 (firmware v0.1 + node protocol v0).
 
 ## Layout
 
