@@ -4,7 +4,17 @@ An open-source harness that gives AI agents access to the radio spectrum through
 
 A **node** (reference: ESP32-S3 + CC1101 433 MHz) captures signals. A **bridge** (Python) decodes and stores them and exposes them through MCP, a CLI, a library and an optional REST API.
 
-> Status: pre-development. Phase 1 (CC1101 wiring and live RSSI) done; next is Phase 2 (firmware v0.1 + node protocol v0).
+> Status: pre-development. Phase 2 (firmware 0.1.0 + [node protocol v0](docs/protocol.md)) done; next is Phase 3 (bridge + MCP). Pending: check OOK pulse quality with a real OOK device (doorbell, RF plug) before Phase 4.
+
+## Try the node
+
+With the reference node on USB (see `tools/node_probe.py --help`):
+
+```
+uv run tools/node_probe.py hello                     # identity and capabilities
+uv run tools/node_probe.py scan --start 430 --end 440 # RSSI sweep + plot
+uv run tools/node_probe.py listen --freq 433.92       # capture OOK pulse frames
+```
 
 ## Layout
 
