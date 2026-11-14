@@ -1,89 +1,253 @@
-// Phase 1: check the CC1101 wiring, then print live RSSI at 433.92 MHz every 100 ms.
+// eter reference node: node protocol v0 over USB serial (docs/protocol.md).
 #include <Arduino.h>
-#include <RadioLib.h>
-#include <SPI.h>
+#include <ArduinoJson.h>
 
-// CC1101 -> ESP32-S3 wiring (PROPOSAL.md §7.3)
-constexpr int PIN_SCK = 12;
-constexpr int PIN_MISO = 13;
-constexpr int PIN_MOSI = 11;
-constexpr int PIN_CSN = 10;
-constexpr int PIN_GDO0 = 4;
-constexpr int PIN_GDO2 = 5;
+#include "radio.h"
 
-constexpr float FREQ_MHZ = 433.92;
+constexpr const char* FW_VERSION = "0.1.0";
+constexpr int PROTOCOL_V = 0;
+constexpr const char* RADIO_ID = "r433";
+constexpr size_t MAX_LINE = 512;
+constexpr int MAX_POINTS = 1001;
 
-CC1101 radio = new Module(PIN_CSN, PIN_GDO0, RADIOLIB_NC, PIN_GDO2);
+char node_id[16];
+bool radio_ok = false;
+char line[MAX_LINE + 1];
+size_t line_len = 0;
+bool line_overflow = false;
+int16_t spectrum[MAX_POINTS];
 
-// Read a CC1101 status register directly over SPI (header byte: read + burst bits set).
-uint8_t readStatusRegister(uint8_t addr) {
-  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(PIN_CSN, LOW);
-  // The chip pulls MISO low when it is ready. Give up after 10 ms (e.g. MISO not wired).
-  uint32_t start = millis();
-  while (digitalRead(PIN_MISO) == HIGH && millis() - start < 10) {
-  }
-  SPI.transfer(addr | 0xC0);
-  uint8_t value = SPI.transfer(0x00);
-  digitalWrite(PIN_CSN, HIGH);
-  SPI.endTransaction();
-  return value;
+void send(const JsonDocument& doc) {
+  serializeJson(doc, Serial);
+  Serial.print('\n');
 }
 
-// Repeat the message so a serial monitor attached after boot still sees it.
-void halt(const char* msg) {
-  while (true) {
-    Serial.println(msg);
-    delay(1000);
+// Message skeleton: {"v":0, "re":<id>, "type":...}. "re" only when the request had an "id".
+JsonDocument message(const char* type, JsonVariantConst id) {
+  JsonDocument doc;
+  doc["v"] = PROTOCOL_V;
+  if (!id.isNull()) doc["re"] = id;
+  doc["type"] = type;
+  return doc;
+}
+
+void sendError(JsonVariantConst id, const char* code, const String& msg) {
+  JsonDocument doc = message("error", id);
+  doc["code"] = code;
+  doc["msg"] = msg;
+  send(doc);
+}
+
+void sendLog(const char* level, const String& msg) {
+  JsonDocument doc = message("log", JsonVariantConst());
+  doc["level"] = level;
+  doc["msg"] = msg;
+  send(doc);
+}
+
+void sendHello(JsonVariantConst id) {
+  JsonDocument doc = message("hello", id);
+  doc["node_id"] = node_id;
+  doc["fw"] = FW_VERSION;
+  JsonObject caps = doc["capabilities"].to<JsonObject>();
+  JsonArray radios = caps["radios"].to<JsonArray>();
+  if (radio_ok) {
+    JsonObject r = radios.add<JsonObject>();
+    r["id"] = RADIO_ID;
+    r["chip"] = "cc1101";
+    JsonArray band = r["bands_mhz"].to<JsonArray>().add<JsonArray>();
+    band.add(radio::BAND_MIN_MHZ);
+    band.add(radio::BAND_MAX_MHZ);
+    r["tuned_mhz"] = 433;
+    r["modulations"].to<JsonArray>().add("ook");
+    r["rx"] = true;
+    r["tx"] = false;
+    JsonArray features = r["features"].to<JsonArray>();
+    features.add("rssi_scan");
+    features.add("rx_pulses");
+  }
+  caps["builtin"].to<JsonArray>();
+  send(doc);
+}
+
+void handleStatus(JsonVariantConst id) {
+  JsonDocument doc = message("status", id);
+  doc["fw"] = FW_VERSION;
+  doc["uptime_s"] = millis() / 1000;
+  doc["heap_free"] = ESP.getFreeHeap();
+  JsonArray radios = doc["radios"].to<JsonArray>();
+  if (radio_ok) radios.add(RADIO_ID);
+  send(doc);
+}
+
+bool inBand(float mhz) { return mhz >= radio::BAND_MIN_MHZ && mhz <= radio::BAND_MAX_MHZ; }
+
+// Validates the "radio" parameter. Sends the error and returns false if it is not usable.
+bool checkRadio(const JsonDocument& req, JsonVariantConst id) {
+  if (!req["radio"].is<const char*>()) {
+    sendError(id, "INVALID", "radio is required");
+    return false;
+  }
+  if (strcmp(req["radio"], RADIO_ID) != 0) {
+    sendError(id, "UNSUPPORTED", "unknown radio");
+    return false;
+  }
+  if (!radio_ok) {
+    sendError(id, "UNSUPPORTED", "radio r433 not available: CC1101 not responding");
+    return false;
+  }
+  return true;
+}
+
+void handleScan(const JsonDocument& req, JsonVariantConst id) {
+  if (!checkRadio(req, id)) return;
+  if (!req["start_mhz"].is<float>() || !req["end_mhz"].is<float>() ||
+      !req["step_khz"].is<float>()) {
+    sendError(id, "INVALID", "start_mhz, end_mhz and step_khz are required numbers");
+    return;
+  }
+  float start = req["start_mhz"];
+  float end = req["end_mhz"];
+  float step = req["step_khz"];
+  if (!inBand(start) || !inBand(end)) {
+    sendError(id, "OUT_OF_BAND", "start_mhz/end_mhz must be inside one band of the radio");
+    return;
+  }
+  if (end <= start || step < 5 || step > 1000) {
+    sendError(id, "INVALID", "need end_mhz > start_mhz and 5 <= step_khz <= 1000");
+    return;
+  }
+  int points = (int)((end - start) * 1000.0f / step + 1e-3f) + 1;
+  if (points > MAX_POINTS) {
+    sendError(id, "INVALID", "too many points (max 1001)");
+    return;
+  }
+
+  int16_t state = radio::scan(start, step, points, spectrum);
+  if (state != 0) {
+    sendError(id, "RADIO", String("RadioLib error ") + state);
+    return;
+  }
+  JsonDocument doc = message("spectrum", id);
+  doc["radio"] = RADIO_ID;
+  doc["start_mhz"] = start;
+  doc["step_khz"] = step;
+  JsonArray rssi = doc["rssi_dbm"].to<JsonArray>();
+  for (int i = 0; i < points; i++) rssi.add(spectrum[i]);
+  send(doc);
+}
+
+void handleRxPulses(const JsonDocument& req, JsonVariantConst id) {
+  if (!checkRadio(req, id)) return;
+  if (!req["freq_mhz"].is<float>() || !req["seconds"].is<float>()) {
+    sendError(id, "INVALID", "freq_mhz and seconds are required numbers");
+    return;
+  }
+  float freq = req["freq_mhz"];
+  float seconds = req["seconds"];
+  if (!inBand(freq)) {
+    sendError(id, "OUT_OF_BAND", "freq_mhz must be inside one band of the radio");
+    return;
+  }
+  if (seconds < 1 || seconds > 60) {
+    sendError(id, "INVALID", "seconds must be between 1 and 60");
+    return;
+  }
+  bool has_threshold = !req["rssi_threshold_dbm"].isNull();
+  if (has_threshold && !req["rssi_threshold_dbm"].is<float>()) {
+    sendError(id, "INVALID", "rssi_threshold_dbm must be a number");
+    return;
+  }
+  int16_t threshold = has_threshold ? (int16_t)lroundf(req["rssi_threshold_dbm"].as<float>()) : 0;
+
+  radio::ListenResult result =
+      radio::listen(freq, (uint32_t)lroundf(seconds), has_threshold, threshold,
+                    [&](const radio::Frame& frame) {
+                      JsonDocument doc = message("pulses", id);
+                      doc["radio"] = RADIO_ID;
+                      doc["freq_mhz"] = freq;
+                      doc["rssi_dbm"] = frame.peak_rssi_dbm;
+                      doc["truncated"] = frame.truncated;
+                      JsonArray t = doc["t_us"].to<JsonArray>();
+                      for (size_t i = 0; i < frame.len; i++) t.add(frame.t_us[i]);
+                      send(doc);
+                    });
+  if (result.state != 0) {
+    sendError(id, "RADIO", String("RadioLib error ") + result.state);
+    return;
+  }
+  JsonDocument doc = message("done", id);
+  doc["frames"] = result.frames;
+  doc["discarded"] = result.discarded;
+  doc["noise_floor_dbm"] = result.noise_floor_dbm;
+  doc["threshold_dbm"] = result.threshold_dbm;
+  send(doc);
+}
+
+void handleLine(const char* text) {
+  JsonDocument req;
+  if (deserializeJson(req, text) != DeserializationError::Ok || !req.is<JsonObject>()) {
+    sendError(JsonVariantConst(), "INVALID", "not a JSON object");
+    return;
+  }
+  JsonVariantConst id = req["id"];
+  JsonVariantConst v = req["v"];
+  if (!v.isNull() && v != PROTOCOL_V) {
+    sendError(id, "VERSION", "unsupported protocol version");
+    return;
+  }
+  const char* type = req["type"] | "";
+  if (strcmp(type, "hello") == 0) {
+    sendHello(id);
+  } else if (strcmp(type, "status") == 0) {
+    handleStatus(id);
+  } else if (strcmp(type, "scan") == 0) {
+    handleScan(req, id);
+  } else if (strcmp(type, "rx_pulses") == 0) {
+    handleRxPulses(req, id);
+  } else {
+    sendError(id, "UNSUPPORTED", "unknown type");
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(2000);  // give the USB serial monitor time to attach
 
-  pinMode(PIN_CSN, OUTPUT);
-  digitalWrite(PIN_CSN, HIGH);
+  // node_id from the last 3 bytes of the factory MAC address.
+  uint64_t mac = ESP.getEfuseMac();
+  snprintf(node_id, sizeof(node_id), "esp32s3-%02x%02x%02x", (uint8_t)(mac >> 24),
+           (uint8_t)(mac >> 32), (uint8_t)(mac >> 40));
 
-  // Wiring check: with CSN low, a powered CC1101 pulls MISO low ("chip ready").
-  pinMode(PIN_MISO, INPUT_PULLUP);
-  delay(1);
-  int miso_csn_high = digitalRead(PIN_MISO);
-  digitalWrite(PIN_CSN, LOW);
-  delay(1);
-  int miso_csn_low = digitalRead(PIN_MISO);
-  digitalWrite(PIN_CSN, HIGH);
-  Serial.printf("MISO with CSN high=%d (expected 1), CSN low=%d (expected 0)\n", miso_csn_high,
-                miso_csn_low);
-
-  SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CSN);
-
-  uint8_t partnum = readStatusRegister(0x30);
-  uint8_t version = readStatusRegister(0x31);
-  Serial.printf("PARTNUM=0x%02X (expected 0x00)\n", partnum);
-  Serial.printf("VERSION=0x%02X (expected 0x14, 0x04, 0x17 or 0x03)\n", version);
-  if (version == 0x00 || version == 0xFF) {
-    halt("CC1101 not responding: check VCC, GND and the SPI wires.");
+  uint8_t version = 0;
+  int16_t state = radio::begin(version);
+  radio_ok = state == 0;
+  if (radio_ok) {
+    sendLog("info", String("CC1101 ready (VERSION=0x") + String(version, HEX) + ")");
+  } else {
+    sendLog("error", String("CC1101 not available (VERSION=0x") + String(version, HEX) +
+                         ", RadioLib " + state + "): check VCC, GND and the SPI wires");
   }
-
-  int16_t state = radio.begin(FREQ_MHZ);
-  if (state == RADIOLIB_ERR_NONE) state = radio.setOOK(true);
-  if (state == RADIOLIB_ERR_NONE) state = radio.receiveDirectAsync();
-  if (state != RADIOLIB_ERR_NONE) {
-    Serial.printf("RadioLib error %d\n", state);
-    halt("Radio setup failed.");
-  }
-  Serial.printf("Listening at %.2f MHz (OOK). Press a 433 MHz remote nearby.\n", FREQ_MHZ);
+  sendHello(JsonVariantConst());
 }
 
 void loop() {
-  float rssi_dbm = radio.getRSSI();
-  int bar = constrain(map((long)rssi_dbm, -110, -30, 0, 40), 0, 40);
-  char bars[41];
-  memset(bars, '#', bar);
-  bars[bar] = '\0';
-  // MARCSTATE 0x0D = RX. Anything else means the chip reset or left RX (power/wiring glitch).
-  uint8_t marcstate = readStatusRegister(0x35) & 0x1F;
-  Serial.printf("rssi_dbm=%6.1f marcstate=0x%02X %s\n", rssi_dbm, marcstate, bars);
-  delay(100);
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      if (line_overflow) {
+        sendError(JsonVariantConst(), "INVALID", "line too long (max 512 bytes)");
+      } else {
+        line[line_len] = '\0';
+        if (line_len > 0) handleLine(line);
+      }
+      line_len = 0;
+      line_overflow = false;
+    } else if (c == '\r') {
+      continue;
+    } else if (line_len < MAX_LINE) {
+      line[line_len++] = c;
+    } else {
+      line_overflow = true;
+    }
+  }
 }
