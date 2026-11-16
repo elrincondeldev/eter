@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from eter_core import analysis, bandplan
+from eter_core import analysis, bandplan, decode
 from eter_core.node import Message, Node, NodeError
 from eter_core.storage import Store
 from eter_core.transport import SerialTransport, Transport, find_serial_port
@@ -21,6 +21,14 @@ OVERLOAD_NOTE = (
     "Some peaks are very strong (above -50 dBm): the transmitter is probably very close and "
     "may overload the receiver, so the same transmitter can appear at several frequencies. "
     "Move it a few metres from the antenna and scan again before drawing conclusions."
+)
+RTL_433_MISSING_NOTE = (
+    "Frames were captured but not decoded: rtl_433 is not installed on the bridge computer "
+    "(macOS: brew install rtl_433)."
+)
+UNKNOWN_NOTE = (
+    "No known protocol matched these frames. Use analyze_capture with this event_id to look at "
+    "their pulse widths and bits."
 )
 FSK_NOTE = (
     "Transmissions were detected but had too few on/off pulses to keep. The signal is probably "
@@ -108,11 +116,23 @@ class Eter:
             request["rssi_threshold_dbm"] = rssi_threshold_dbm
         replies = node.request(request, timeout_s=seconds + 5)
         done = replies[-1]
-        frames = [
-            analysis.summarize_frame(m["t_us"], m["rssi_dbm"], m["truncated"])
-            for m in replies
-            if m["type"] == "pulses"
-        ]
+        frames = []
+        devices: dict[str, dict[str, Any]] = {}
+        labels = self.store.device_labels()
+        for message in (m for m in replies if m["type"] == "pulses"):
+            frame = analysis.summarize_frame(
+                message["t_us"], message["rssi_dbm"], message["truncated"]
+            )
+            frame["decoded_as"] = []
+            for decoded in decode.decode_frame(message["t_us"]):
+                key = decode.device_key(decoded)
+                frame["decoded_as"].append(key)
+                self.store.see_device(key, decoded["model"], freq_mhz, message["rssi_dbm"], decoded)
+                label, owned = labels.get(key, (None, False))
+                device = devices.setdefault(key, {"device": key, "label": label, "owned": owned})
+                device["frames"] = device.get("frames", 0) + 1
+                device["data"] = decoded
+            frames.append(frame)
         summary: dict[str, Any] = {
             "radio": radio["id"],
             "freq_mhz": freq_mhz,
@@ -121,10 +141,15 @@ class Eter:
             "threshold_dbm": done["threshold_dbm"],
             "frames": done["frames"],
             "discarded": done["discarded"],
+            "devices": list(devices.values()),
             "frame_summaries": frames[:20],
         }
         if done["discarded"] and not done["frames"]:
             summary["note"] = FSK_NOTE
+        elif frames and not decode.available():
+            summary["note"] = RTL_433_MISSING_NOTE
+        elif frames and not devices:
+            summary["note"] = UNKNOWN_NOTE
         summary["event_id"] = self.store.add_event(
             node.node_id, "listen", radio["id"], freq_mhz, summary, replies
         )
@@ -153,12 +178,34 @@ class Eter:
             event["summary"] = _brief(event["kind"], event["summary"])
         return {"count": len(events), "events": events}
 
+    def analyze(self, event_id: int, max_frames: int = 3) -> dict[str, Any]:
+        stored = self.store.event_messages(event_id)
+        if stored is None or stored[0] != "listen":
+            raise NodeError("INVALID", f"event {event_id} is not a listen event")
+        frames = [m for m in stored[1] if m["type"] == "pulses"]
+        return {
+            "event_id": event_id,
+            "frames": len(frames),
+            "analysis": [analysis.analyze_frame(m["t_us"]) for m in frames[:max_frames]],
+        }
+
+    def devices(self, limit: int = 50) -> dict[str, Any]:
+        devices = self.store.devices(min(limit, 200))
+        return {"count": len(devices), "devices": devices}
+
+    def label_device(self, device: str, label: str, owned: bool = False) -> dict[str, Any]:
+        if not self.store.label_device(device, label, owned):
+            raise NodeError("INVALID", f"unknown device {device!r}; see list_devices")
+        return {"device": device, "label": label, "owned": owned}
+
 
 def _brief(kind: str, summary: dict[str, Any]) -> dict[str, Any]:
     """Compact version of a stored summary for history listings."""
     if kind == "scan":
         return {"noise_floor_dbm": summary["noise_floor_dbm"], "top_peaks": summary["peaks"][:3]}
-    return {k: summary[k] for k in ("frames", "discarded", "threshold_dbm")}
+    brief = {k: summary[k] for k in ("frames", "discarded", "threshold_dbm")}
+    brief["devices"] = [d["device"] for d in summary.get("devices", [])]
+    return brief
 
 
 def open_eter() -> Eter:

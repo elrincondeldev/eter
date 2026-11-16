@@ -4,7 +4,7 @@ An open-source harness that gives AI agents access to the radio spectrum through
 
 A **node** (reference: ESP32-S3 + CC1101 433 MHz) captures signals. A **bridge** (Python) decodes and stores them and exposes them through MCP, a CLI, a library and an optional REST API.
 
-> Status: pre-development. Phase 3 (bridge + MCP) done: Claude Code can scan and listen through the node. Next is Phase 4 (decoding). Pending first: check OOK pulse quality with a real OOK device (doorbell, RF plug).
+> Status: pre-development. Phase 4 (decoding) in progress: decoding with rtl_433, devices and pulse analysis done and checked with a real OOK remote; background monitoring pending.
 
 ## Use it from Claude Code
 
@@ -16,7 +16,12 @@ The repo's `.mcp.json` registers the `eter` MCP server. Open Claude Code in the 
 | `identify_frequency` | Typical uses of a frequency (Europe) | — |
 | `query_events` | History of scans and listens | — |
 | `scan_spectrum` | Sweep a range: noise floor and peaks | a radio with `rssi_scan` |
-| `listen` | Capture on/off transmissions on one frequency | a radio with `rx_pulses` |
+| `listen` | Capture on/off transmissions on one frequency and decode known devices | a radio with `rx_pulses` |
+| `analyze_capture` | Pulse widths, modulation guess and bits of an earlier listen | a radio with `rx_pulses` |
+| `list_devices` | Devices decoded so far, with their last data | — |
+| `label_device` | Name a device and mark it as yours | — |
+
+Decoding uses [rtl_433](https://github.com/merbanan/rtl_433) as an external program (macOS: `brew install rtl_433`). Without it, `listen` still captures frames but cannot name them.
 
 The same operations are available as a CLI that prints JSON:
 
@@ -26,6 +31,9 @@ uv run --directory bridge eter scan --start 430 --end 440
 uv run --directory bridge eter listen --freq 433.92 --seconds 10
 uv run --directory bridge eter identify 446.1
 uv run --directory bridge eter events --since 60
+uv run --directory bridge eter analyze <event_id>
+uv run --directory bridge eter devices
+uv run --directory bridge eter label <device> "Living room thermometer" --owned
 ```
 
 Configuration (environment variables):

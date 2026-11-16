@@ -12,8 +12,11 @@ eter connects you to radio hardware (a "node") near the user. Use it to explore 
 spectrum, find active transmitters and explain what they probably are.
 
 - Start with node_status to see which radio is connected and its frequency bands.
-- scan_spectrum finds active frequencies; listen captures the on/off pattern of transmissions
-  on one frequency; identify_frequency tells what a frequency is typically used for.
+- scan_spectrum finds active frequencies; listen captures transmissions on one frequency and
+  decodes known devices (sensors, remotes); identify_frequency tells what a frequency is
+  typically used for.
+- Devices decoded by listen are remembered: list_devices shows them; label_device names the
+  user's own ones. For frames no decoder recognised, analyze_capture shows pulse widths and bits.
 - Results are summaries, never raw samples. Units are in field names (freq_mhz, rssi_dbm).
 - RSSI: about -100 dBm is nothing, -40 dBm is very strong.
 - Transmitters near the user may belong to neighbours: describe them, never publish their data.
@@ -62,19 +65,52 @@ def build_server(eter: Eter) -> MCPServer:
             float | None, Field(description="Detection threshold; default noise floor + 15 dB")
         ] = None,
     ) -> dict[str, Any]:
-        """Listen on one frequency (on/off keying) and summarize each transmission captured: number
-        of pulses, duration, strength and pulse widths. Blocks for `seconds`; tell the user to
-        press their remote or trigger their sensor during that time."""
+        """Listen on one frequency (on/off keying), decode known devices (weather stations,
+        sensors, remotes) and summarize each transmission: pulses, duration, strength and pulse
+        widths. Blocks for `seconds`; tell the user to press their remote or trigger their sensor
+        during that time. Decoded devices are remembered for list_devices."""
         return eter.listen(freq_mhz, seconds, rssi_threshold_dbm)
+
+    def analyze_capture(
+        event_id: Annotated[int, Field(description="event_id returned by listen")],
+        max_frames: Annotated[int, Field(description="Frames to analyze, first ones")] = 3,
+    ) -> dict[str, Any]:
+        """Analyze the frames of an earlier listen: distinct pulse and gap widths, modulation guess
+        (PWM or PPM), bit rows in binary and hex, and how many rows repeat. Use it to reason about
+        signals no decoder recognised, e.g. to tell which bits change between two button presses."""
+        return eter.analyze(event_id, max_frames)
+
+    def list_devices(
+        limit: Annotated[int, Field(description="Max devices, most recently seen first")] = 50,
+    ) -> dict[str, Any]:
+        """Devices decoded so far: model, user label, whether the user owns it, when it was first and
+        last seen, how often, signal strength and its last decoded data (e.g. temperature)."""
+        return eter.devices(limit)
+
+    def label_device(
+        device: Annotated[
+            str, Field(description="Device key from list_devices, e.g. 'Nexus-TH/42/1'")
+        ],
+        label: Annotated[str, Field(description="Name, e.g. 'Living room thermometer'")],
+        owned: Annotated[
+            bool, Field(description="True only if the user says it is theirs")
+        ] = False,
+    ) -> dict[str, Any]:
+        """Give a decoded device a name and mark whether it belongs to the user. Only mark owned=true
+        when the user confirms the device is theirs."""
+        return eter.label_device(device, label, owned)
 
     server.add_tool(node_status)
     server.add_tool(identify_frequency)
     server.add_tool(query_events)
+    server.add_tool(list_devices)
+    server.add_tool(label_device)
     features = eter.features()
     if "rssi_scan" in features:
         server.add_tool(scan_spectrum)
     if "rx_pulses" in features:
         server.add_tool(listen)
+        server.add_tool(analyze_capture)
     return server
 
 
