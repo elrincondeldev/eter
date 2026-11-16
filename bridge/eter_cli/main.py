@@ -65,3 +65,28 @@ def events(
 ) -> None:
     """History of scans and listens, newest first."""
     _run("events", kind, since, limit)
+
+
+@app.command()
+def analyze(
+    event_id: Annotated[int, typer.Argument(help="event_id of a listen")],
+    frames: Annotated[int, typer.Option(help="frames to analyze")] = 3,
+) -> None:
+    """Pulse widths, modulation guess and bits of the frames of a listen."""
+    _run("analyze", event_id, frames)
+
+
+@app.command()
+def devices(limit: Annotated[int, typer.Option()] = 50) -> None:
+    """Decoded devices, most recently seen first."""
+    _run("devices", limit)
+
+
+@app.command()
+def label(
+    device: Annotated[str, typer.Argument(help="device key from `eter devices`")],
+    name: Annotated[str, typer.Argument(help="label to give it")],
+    owned: Annotated[bool, typer.Option(help="the device is yours")] = False,
+) -> None:
+    """Name a decoded device."""
+    _run("label_device", device, name, owned)
