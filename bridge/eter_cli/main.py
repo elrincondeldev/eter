@@ -1,6 +1,7 @@
 """`eter` command line: the same operations as the MCP server, printed as JSON."""
 
 import json
+import time
 from typing import Annotated, Any
 
 import typer
@@ -29,6 +30,33 @@ def _run(operation: str, *args: Any) -> None:
 def status() -> None:
     """Connected node, firmware and radios."""
     _run("status")
+
+
+@app.command()
+def monitor(
+    preset: Annotated[str, typer.Option(help="sensors_433")] = "sensors_433",
+    minutes: Annotated[float, typer.Option(help="how long; Ctrl+C stops earlier")] = 5.0,
+) -> None:
+    """Listen in the background for a while, announcing devices as they are decoded."""
+    eter = open_eter()
+    try:
+        eter.monitor.start(preset)
+    except NodeError as error:
+        typer.echo(f"error: {error}", err=True)
+        raise typer.Exit(1) from error
+    typer.echo(f"Monitoring {preset} for {minutes:g} min (Ctrl+C to stop)...", err=True)
+    announced: set[str] = set()
+    deadline = time.monotonic() + minutes * 60
+    try:
+        while time.monotonic() < deadline and eter.monitor.running:
+            time.sleep(1)
+            for device in eter.monitor.status().get("devices_seen", []):
+                if device not in announced:
+                    announced.add(device)
+                    typer.echo(f"{time.strftime('%H:%M:%S')} new device: {device}", err=True)
+    except KeyboardInterrupt:
+        pass
+    _print(eter.monitor.stop())
 
 
 @app.command()

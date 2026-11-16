@@ -1,11 +1,15 @@
 """The operations every facade (MCP, CLI) exposes, on top of one node and the event store."""
 
 import os
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from eter_core import analysis, bandplan, decode
+from eter_core.monitor import Monitor
 from eter_core.node import Message, Node, NodeError
 from eter_core.storage import Store
 from eter_core.transport import SerialTransport, Transport, find_serial_port
@@ -41,6 +45,24 @@ class Eter:
         self.node = node
         self.store = store
         self.node_error = node_error
+        self.monitor = Monitor(self)
+        self._waiting = 0
+        self._waiting_lock = threading.Lock()
+
+    @contextmanager
+    def _interactive(self) -> Iterator[None]:
+        """Mark a request from the AI or the user: the background monitor lets it go first."""
+        with self._waiting_lock:
+            self._waiting += 1
+        try:
+            yield
+        finally:
+            with self._waiting_lock:
+                self._waiting -= 1
+
+    @property
+    def interactive_waiting(self) -> bool:
+        return self._waiting > 0
 
     def features(self) -> set[str]:
         if self.node is None:
@@ -50,7 +72,8 @@ class Eter:
     def status(self) -> dict[str, Any]:
         if self.node is None:
             return {"connected": False, "error": self.node_error}
-        status = self.node.request({"type": "status"}, timeout_s=3)[-1]
+        with self._interactive():
+            status = self.node.request({"type": "status"}, timeout_s=3)[-1]
         radios = [
             {k: r[k] for k in ("id", "chip", "bands_mhz", "tuned_mhz", "modulations", "features")}
             for r in self.node.radios
@@ -61,9 +84,11 @@ class Eter:
             "fw": status["fw"],
             "uptime_s": status["uptime_s"],
             "radios": radios,
+            "monitor": self.monitor.status(),
         }
 
-    def _radio(self, feature: str) -> tuple[Node, Message]:
+    def require(self, feature: str) -> tuple[Node, Message]:
+        """The connected node and its first radio with `feature`, or NodeError."""
         if self.node is None:
             raise NodeError("NO_NODE", f"no node connected: {self.node_error}")
         radio = self.node.radio_with(feature)
@@ -72,7 +97,7 @@ class Eter:
         return self.node, radio
 
     def scan(self, start_mhz: float, end_mhz: float, step_khz: float = 25) -> dict[str, Any]:
-        node, radio = self._radio("rssi_scan")
+        node, radio = self.require("rssi_scan")
         points = (end_mhz - start_mhz) * 1000 / step_khz + 1
         request = {
             "type": "scan",
@@ -81,7 +106,8 @@ class Eter:
             "end_mhz": end_mhz,
             "step_khz": step_khz,
         }
-        replies = node.request(request, timeout_s=points * 0.005 + 5)
+        with self._interactive():
+            replies = node.request(request, timeout_s=points * 0.005 + 5)
         rssi = replies[-1]["rssi_dbm"]
         peaks = analysis.find_peaks(start_mhz, step_khz, rssi)
         for peak in peaks:
@@ -105,7 +131,15 @@ class Eter:
     def listen(
         self, freq_mhz: float, seconds: int = 10, rssi_threshold_dbm: float | None = None
     ) -> dict[str, Any]:
-        node, radio = self._radio("rx_pulses")
+        with self._interactive():
+            return self.capture(freq_mhz, seconds, rssi_threshold_dbm, kind="listen")
+
+    def capture(
+        self, freq_mhz: float, seconds: int, rssi_threshold_dbm: float | None, kind: str
+    ) -> dict[str, Any]:
+        """Listen, decode and remember devices. Saved as an event if `kind` is listen, or if a
+        monitor chunk heard something (empty monitor chunks would flood the history)."""
+        node, radio = self.require("rx_pulses")
         request: Message = {
             "type": "rx_pulses",
             "radio": radio["id"],
@@ -150,9 +184,11 @@ class Eter:
             summary["note"] = RTL_433_MISSING_NOTE
         elif frames and not devices:
             summary["note"] = UNKNOWN_NOTE
-        summary["event_id"] = self.store.add_event(
-            node.node_id, "listen", radio["id"], freq_mhz, summary, replies
-        )
+        summary["event_id"] = None
+        if kind == "listen" or done["frames"]:
+            summary["event_id"] = self.store.add_event(
+                node.node_id, kind, radio["id"], freq_mhz, summary, replies
+            )
         return summary
 
     def identify(self, freq_mhz: float) -> dict[str, Any]:
@@ -180,8 +216,8 @@ class Eter:
 
     def analyze(self, event_id: int, max_frames: int = 3) -> dict[str, Any]:
         stored = self.store.event_messages(event_id)
-        if stored is None or stored[0] != "listen":
-            raise NodeError("INVALID", f"event {event_id} is not a listen event")
+        if stored is None or stored[0] not in ("listen", "monitor"):
+            raise NodeError("INVALID", f"event {event_id} is not a listen or monitor event")
         frames = [m for m in stored[1] if m["type"] == "pulses"]
         return {
             "event_id": event_id,
@@ -197,6 +233,9 @@ class Eter:
         if not self.store.label_device(device, label, owned):
             raise NodeError("INVALID", f"unknown device {device!r}; see list_devices")
         return {"device": device, "label": label, "owned": owned}
+
+    def set_monitor(self, preset: str, enabled: bool) -> dict[str, Any]:
+        return self.monitor.start(preset) if enabled else self.monitor.stop()
 
 
 def _brief(kind: str, summary: dict[str, Any]) -> dict[str, Any]:
