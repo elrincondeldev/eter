@@ -2,6 +2,8 @@
 
 import json
 import shutil
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -155,7 +157,7 @@ def tool_names(eter: Eter) -> set[str]:
 
 def test_mcp_tools_follow_capabilities(eter: Eter, tmp_path: Path) -> None:
     always = {"node_status", "identify_frequency", "query_events", "list_devices", "label_device"}
-    assert tool_names(eter) == always | {"scan_spectrum", "listen", "analyze_capture"}
+    assert tool_names(eter) == always | {"scan_spectrum", "listen", "analyze_capture", "monitor"}
     no_node = Eter(None, Store(tmp_path / "other.db"), node_error="no node")
     assert tool_names(no_node) == always
 
@@ -166,3 +168,41 @@ def test_cli_scan(captures: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     result = CliRunner().invoke(app, ["scan"])
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["peaks"][0]["freq_mhz"] == 434.7
+
+
+def wait_for(condition: Callable[[], bool], timeout_s: float = 3) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.01)
+
+
+@needs_rtl_433
+def test_monitor_records_devices_in_background(eter: Eter) -> None:
+    status = eter.set_monitor("sensors_433", enabled=True)
+    assert (status["running"], status["freq_mhz"]) == (True, 433.92)
+    wait_for(lambda: eter.monitor.status()["chunks"] >= 2)
+    # Interactive requests still go through while the monitor runs.
+    assert eter.scan(430.0, 440.0, 25)["peaks"]
+    assert eter.status()["monitor"]["running"]
+    status = eter.set_monitor("sensors_433", enabled=False)
+    assert not status["running"]
+    assert status["devices_seen"] == [REMOTE]
+    assert eter.devices()["devices"][0]["seen_count"] == status["chunks"]
+    assert eter.events(kind="monitor")["count"] == status["chunks"]
+
+
+def test_monitor_rejects_unknown_preset(eter: Eter) -> None:
+    with pytest.raises(NodeError):
+        eter.set_monitor("sensors_999", enabled=True)
+    assert not eter.monitor.running
+
+
+def test_interactive_requests_pause_the_monitor(eter: Eter) -> None:
+    eter.set_monitor("sensors_433", enabled=True)
+    with eter._interactive():
+        before = eter.monitor.status()["chunks"]
+        time.sleep(0.3)
+        # At most the chunk already in flight finishes while a request is waiting.
+        assert eter.monitor.status()["chunks"] <= before + 1
+    eter.set_monitor("sensors_433", enabled=False)

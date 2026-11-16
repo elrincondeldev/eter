@@ -17,6 +17,8 @@ spectrum, find active transmitters and explain what they probably are.
   typically used for.
 - Devices decoded by listen are remembered: list_devices shows them; label_device names the
   user's own ones. For frames no decoder recognised, analyze_capture shows pulse widths and bits.
+- monitor keeps listening in the background (e.g. preset sensors_433) while the session lasts;
+  what it decodes shows up in list_devices and query_events(kind="monitor").
 - Results are summaries, never raw samples. Units are in field names (freq_mhz, rssi_dbm).
 - RSSI: about -100 dBm is nothing, -40 dBm is very strong.
 - Transmitters near the user may belong to neighbours: describe them, never publish their data.
@@ -39,11 +41,14 @@ def build_server(eter: Eter) -> MCPServer:
         return eter.identify(freq_mhz)
 
     def query_events(
-        kind: Annotated[str | None, Field(description="'scan' or 'listen'; omit for all")] = None,
+        kind: Annotated[
+            str | None, Field(description="'scan', 'listen' or 'monitor'; omit for all")
+        ] = None,
         since_minutes: Annotated[int | None, Field(description="Only the last N minutes")] = None,
         limit: Annotated[int, Field(description="Max events, newest first (max 100)")] = 20,
     ) -> dict[str, Any]:
-        """History of earlier scans and listens, newest first, with a short summary of each."""
+        """History of earlier scans, listens and background monitor captures (only those that
+        heard something), newest first, with a short summary of each."""
         return eter.events(kind, since_minutes, limit)
 
     def scan_spectrum(
@@ -100,6 +105,18 @@ def build_server(eter: Eter) -> MCPServer:
         when the user confirms the device is theirs."""
         return eter.label_device(device, label, owned)
 
+    def monitor(
+        preset: Annotated[
+            str, Field(description="What to listen for; 'sensors_433'")
+        ] = "sensors_433",
+        enabled: Annotated[bool, Field(description="true to start, false to stop")] = True,
+    ) -> dict[str, Any]:
+        """Start or stop background listening. While it runs (only as long as this session), the
+        node listens in 5 s chunks and decoded devices are recorded; your own scan or listen
+        requests go first and wait at most one chunk. Returns the monitor status: chunks, frames
+        and devices seen so far. node_status also reports it."""
+        return eter.set_monitor(preset, enabled)
+
     server.add_tool(node_status)
     server.add_tool(identify_frequency)
     server.add_tool(query_events)
@@ -111,6 +128,7 @@ def build_server(eter: Eter) -> MCPServer:
     if "rx_pulses" in features:
         server.add_tool(listen)
         server.add_tool(analyze_capture)
+        server.add_tool(monitor)
     return server
 
 

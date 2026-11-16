@@ -4,7 +4,7 @@ An open-source harness that gives AI agents access to the radio spectrum through
 
 A **node** (reference: ESP32-S3 + CC1101 433 MHz) captures signals. A **bridge** (Python) decodes and stores them and exposes them through MCP, a CLI, a library and an optional REST API.
 
-> Status: pre-development. Phase 4 (decoding) in progress: decoding with rtl_433, devices and pulse analysis done and checked with a real OOK remote; background monitoring pending.
+> Status: pre-development. Phase 4 (decoding) done: rtl_433 decoding, devices, pulse analysis and background monitoring, checked on the reference node. Next is Phase 5 (Wi-Fi, BLE and running 24/7).
 
 ## Use it from Claude Code
 
@@ -20,6 +20,7 @@ The repo's `.mcp.json` registers the `eter` MCP server. Open Claude Code in the 
 | `analyze_capture` | Pulse widths, modulation guess and bits of an earlier listen | a radio with `rx_pulses` |
 | `list_devices` | Devices decoded so far, with their last data | — |
 | `label_device` | Name a device and mark it as yours | — |
+| `monitor` | Keep listening in the background (preset `sensors_433`) while the session lasts | a radio with `rx_pulses` |
 
 Decoding uses [rtl_433](https://github.com/merbanan/rtl_433) as an external program (macOS: `brew install rtl_433`). Without it, `listen` still captures frames but cannot name them.
 
@@ -34,6 +35,7 @@ uv run --directory bridge eter events --since 60
 uv run --directory bridge eter analyze <event_id>
 uv run --directory bridge eter devices
 uv run --directory bridge eter label <device> "Living room thermometer" --owned
+uv run --directory bridge eter monitor --minutes 10
 ```
 
 Configuration (environment variables):
