@@ -3,10 +3,23 @@ name = "eter"
 version = "0.0.0"
 description = "Bridge between radio nodes and AI agents"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "mcp>=2.3.0,<3",
+    "pyserial>=3.5",
+    "typer>=0.29.1",
+]
+
+[project.scripts]
+eter = "eter_cli.main:app"
+eter-mcp = "eter_mcp.server:main"
 
 [dependency-groups]
-dev = ["pytest", "ruff", "mypy"]
+dev = [
+    "pytest",
+    "ruff",
+    "mypy",
+    "types-pyserial>=3.5.0.20261104",
+]
 
 [build-system]
 requires = ["hatchling"]

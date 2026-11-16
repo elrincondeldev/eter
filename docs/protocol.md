@@ -169,9 +169,12 @@ Human-readable diagnostics. Never needed to drive the node.
 
 ## 6. Capture files
 
-Tools that record node traffic (and `eter_sim`, which replays it) use the same format: an NDJSON file whose **first line is the node's `hello`**, followed by node → bridge messages exactly as received. Stored in `captures/`.
+Tools that record node traffic (and `eter_sim`, which replays it) use the same format: an NDJSON file whose **first line is the node's `hello`**, followed by node → bridge messages exactly as received. A `re` field may be dropped.
 
-Only commit captures of devices you own: frames from neighbours' devices can contain their identifiers.
+- `captures/` holds curated, committed captures: the default data set of `eter_sim` and the tests.
+- `tools/node_probe.py` writes new recordings to `tmp/captures/` (not committed). Review one before moving it into `captures/`.
+
+Only commit captures of devices you own: frames from neighbours' devices can contain their identifiers. Anonymise `node_id`.
 
 ## 7. Changelog
 
