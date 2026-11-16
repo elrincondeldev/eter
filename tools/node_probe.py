@@ -10,7 +10,7 @@ Phase 2 dev tool, not part of the bridge.
     uv run tools/node_probe.py scan --start 430 --end 440 --step 25
     uv run tools/node_probe.py listen --freq 433.92 --seconds 10
 
-Captures go to captures/ (format: docs/protocol.md §6); plots go to tmp/.
+Recordings go to tmp/captures/ (format: docs/protocol.md §6); plots go to tmp/.
 """
 
 import argparse
@@ -26,7 +26,7 @@ import serial
 from serial.tools import list_ports
 
 ROOT = Path(__file__).resolve().parent.parent
-CAPTURES = ROOT / "captures"
+CAPTURES = ROOT / "tmp" / "captures"
 PLOTS = ROOT / "tmp"
 FINAL_TYPES = {"hello", "status", "spectrum", "done", "error"}
 
@@ -75,7 +75,7 @@ class Node:
 
 
 def save_capture(kind: str, messages: list[Message]) -> Path:
-    CAPTURES.mkdir(exist_ok=True)
+    CAPTURES.mkdir(parents=True, exist_ok=True)
     path = CAPTURES / f"{kind}-{datetime.now():%Y%m%d-%H%M%S}.ndjson"
     path.write_text("".join(json.dumps(m) + "\n" for m in messages))
     return path
