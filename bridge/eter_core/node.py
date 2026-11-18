@@ -8,7 +8,8 @@ from typing import Any
 from eter_core.transport import Transport
 
 Message = dict[str, Any]
-FINAL_TYPES = {"hello", "status", "spectrum", "done", "error"}
+PROTOCOL_V = 1
+FINAL_TYPES = {"hello", "status", "spectrum", "paired", "done", "error"}
 
 
 class NodeError(Exception):
@@ -21,12 +22,15 @@ class NodeError(Exception):
 
 
 class Node:
-    def __init__(self, transport: Transport) -> None:
+    def __init__(self, transport: Transport, link: str = "usb") -> None:
+        """`link`: how the node is reached, `usb`, `wifi` or `sim`."""
         self._transport = transport
+        self.link = link
         self._next_id = 1
         # The node runs one command at a time; so do we.
         self._lock = threading.Lock()
         self.hello = self.request({"type": "hello"}, timeout_s=3)[-1]
+        self.hello.pop("token", None)  # a secret: keep it out of everything we show or store
 
     @property
     def node_id(self) -> str:
@@ -42,10 +46,16 @@ class Node:
 
     def request(self, msg: Message, timeout_s: float) -> list[Message]:
         """Send a command; return all its replies, the final one last. Raises NodeError."""
+        try:
+            return self._request(msg, timeout_s)
+        except OSError as error:
+            raise NodeError("DISCONNECTED", f"lost the link to the node: {error}") from error
+
+    def _request(self, msg: Message, timeout_s: float) -> list[Message]:
         with self._lock:
             request_id = self._next_id
             self._next_id += 1
-            self._transport.write_line(json.dumps({"v": 0, "id": request_id, **msg}))
+            self._transport.write_line(json.dumps({"v": PROTOCOL_V, "id": request_id, **msg}))
             replies: list[Message] = []
             deadline = time.monotonic() + timeout_s
             while (remaining := deadline - time.monotonic()) > 0:

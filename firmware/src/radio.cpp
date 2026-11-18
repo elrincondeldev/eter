@@ -2,6 +2,7 @@
 
 #include <RadioLib.h>
 #include <SPI.h>
+#include <esp_task_wdt.h>
 
 namespace radio {
 namespace {
@@ -147,6 +148,7 @@ int16_t begin(uint8_t& version) {
 int16_t scan(float start_mhz, float step_khz, int points, int16_t* rssi_dbm) {
   int16_t state = cc.setRxBandwidth(SCAN_BW_KHZ);
   for (int i = 0; i < points && state == RADIOLIB_ERR_NONE; i++) {
+    esp_task_wdt_reset();
     state = cc.setFrequency(start_mhz + i * step_khz / 1000.0f);
     if (state == RADIOLIB_ERR_NONE) state = cc.receiveDirectAsync();
     delayMicroseconds(SETTLE_US);
@@ -193,6 +195,7 @@ ListenResult listen(float freq_mhz, uint32_t seconds, bool has_threshold, int16_
   };
 
   while ((int32_t)(millis() - end_ms) < 0) {
+    esp_task_wdt_reset();  // a listen lasts up to 60 s, longer than the watchdog
     int16_t rssi = readRssi();
     uint32_t now = micros();
     if (rssi >= result.threshold_dbm) {

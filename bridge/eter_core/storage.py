@@ -1,5 +1,7 @@
 """SQLite history of what the bridge has observed."""
 
+import hashlib
+import hmac
 import json
 import sqlite3
 import threading
@@ -30,9 +32,19 @@ CREATE TABLE IF NOT EXISTS devices (
     rssi_dbm INTEGER NOT NULL,
     last_data TEXT NOT NULL    -- JSON: last decoded message
 );
+CREATE TABLE IF NOT EXISTS nodes (
+    node_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,       -- pending | approved | paired (docs/protocol.md §1.2)
+    token_sha256 TEXT,         -- hash of the pairing token; the token itself is not kept
+    address TEXT NOT NULL,     -- IP address of its last connection
+    fw TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL
+);
 """
 DEVICE_KEYS = ["key", "model", "label", "owned", "first_seen", "last_seen", "seen_count"]
 DEVICE_KEYS += ["freq_mhz", "rssi_dbm"]
+NODE_KEYS = ["node_id", "state", "address", "fw", "first_seen", "last_seen"]
 
 
 def now_utc() -> str:
@@ -141,3 +153,68 @@ class Store:
         with self._lock:
             rows = self._db.execute("SELECT key, label, owned FROM devices").fetchall()
         return {key: (label, bool(owned)) for key, label, owned in rows}
+
+    def node_connected(self, node_id: str, address: str, fw: str) -> str:
+        """Record a Wi-Fi node's connection (new nodes start pending). Returns its state."""
+        now = now_utc()
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO nodes (node_id, state, address, fw, first_seen, last_seen)"
+                " VALUES (?, 'pending', ?, ?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET"
+                " address = excluded.address, fw = excluded.fw, last_seen = excluded.last_seen",
+                (node_id, address, fw, now, now),
+            )
+        state = self.node_state(node_id)
+        assert state is not None
+        return state
+
+    def node_state(self, node_id: str) -> str | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT state FROM nodes WHERE node_id = ?", (node_id,)
+            ).fetchone()
+        return None if row is None else str(row[0])
+
+    def token_matches(self, node_id: str, token: str) -> bool:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT token_sha256 FROM nodes WHERE node_id = ? AND state = 'paired'",
+                (node_id,),
+            ).fetchone()
+        return row is not None and hmac.compare_digest(row[0], token_hash(token))
+
+    def approve_node(self, node_id: str) -> str | None:
+        """Approve a pending node. Returns its state afterwards, or None if never seen."""
+        with self._lock, self._db:
+            self._db.execute(
+                "UPDATE nodes SET state = 'approved' WHERE node_id = ? AND state = 'pending'",
+                (node_id,),
+            )
+        return self.node_state(node_id)
+
+    def set_paired(self, node_id: str, token: str) -> None:
+        with self._lock, self._db:
+            self._db.execute(
+                "UPDATE nodes SET state = 'paired', token_sha256 = ? WHERE node_id = ?",
+                (token_hash(token), node_id),
+            )
+
+    def forget_node(self, node_id: str) -> bool:
+        with self._lock, self._db:
+            cursor = self._db.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
+        return cursor.rowcount == 1
+
+    def nodes(self, state: str | None = None) -> list[dict[str, Any]]:
+        """Wi-Fi nodes that ever connected, most recently seen first."""
+        query = f"SELECT {', '.join(NODE_KEYS)} FROM nodes"
+        params: tuple[str, ...] = ()
+        if state:
+            query += " WHERE state = ?"
+            params = (state,)
+        with self._lock:
+            rows = self._db.execute(query + " ORDER BY last_seen DESC", params).fetchall()
+        return [dict(zip(NODE_KEYS, row)) for row in rows]
+
+
+def token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()

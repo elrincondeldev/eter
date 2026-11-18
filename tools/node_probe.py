@@ -2,7 +2,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["pyserial", "matplotlib"]
 # ///
-"""Talk to an eter node over USB with node protocol v0 (docs/protocol.md).
+"""Talk to an eter node over USB with the node protocol (docs/protocol.md).
 
 Phase 2 dev tool, not part of the bridge.
 
@@ -50,7 +50,7 @@ class Node:
 
     def request(self, msg: Message, timeout_s: float) -> Iterator[Message]:
         """Send a command and yield its replies until the final one."""
-        msg = {"v": 0, "id": self.next_id, **msg}
+        msg = {"v": 1, "id": self.next_id, **msg}
         self.next_id += 1
         self.serial.write((json.dumps(msg) + "\n").encode())
         deadline = time.monotonic() + timeout_s

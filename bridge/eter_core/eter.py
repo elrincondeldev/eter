@@ -2,7 +2,7 @@
 
 import os
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,14 +40,49 @@ FSK_NOTE = (
 )
 
 
+WAITING_FOR_NODES = (
+    "no node connected yet. A paired Wi-Fi node connects by itself once powered; a new one "
+    "must be approved first (see pending_approval, or run `eter nodes`)"
+)
+
+
 class Eter:
     def __init__(self, node: Node | None, store: Store, node_error: str | None = None) -> None:
-        self.node = node
         self.store = store
         self.node_error = node_error
         self.monitor = Monitor(self)
         self._waiting = 0
         self._waiting_lock = threading.Lock()
+        # Connected nodes by node_id, oldest first. Operations use the most recent one.
+        self._nodes: dict[str, Node] = {}
+        self._nodes_lock = threading.Lock()
+        self.on_nodes_changed: list[Callable[[], None]] = []
+        if node is not None:
+            self.attach(node)
+
+    @property
+    def node(self) -> Node | None:
+        with self._nodes_lock:
+            return next(reversed(self._nodes.values()), None)
+
+    def attach(self, node: Node) -> None:
+        """A node connected (a newer link to the same node replaces the old one)."""
+        with self._nodes_lock:
+            self._nodes.pop(node.node_id, None)
+            self._nodes[node.node_id] = node
+        self._nodes_changed()
+
+    def detach(self, node: Node) -> None:
+        """A node's link was lost. Ignored if that link was already replaced."""
+        with self._nodes_lock:
+            if self._nodes.get(node.node_id) is not node:
+                return
+            del self._nodes[node.node_id]
+        self._nodes_changed()
+
+    def _nodes_changed(self) -> None:
+        for callback in self.on_nodes_changed:
+            callback()
 
     @contextmanager
     def _interactive(self) -> Iterator[None]:
@@ -65,36 +100,52 @@ class Eter:
         return self._waiting > 0
 
     def features(self) -> set[str]:
-        if self.node is None:
+        node = self.node
+        if node is None:
             return set()
-        return {feature for radio in self.node.radios for feature in radio["features"]}
+        return {feature for radio in node.radios for feature in radio["features"]}
 
     def status(self) -> dict[str, Any]:
-        if self.node is None:
-            return {"connected": False, "error": self.node_error}
-        with self._interactive():
-            status = self.node.request({"type": "status"}, timeout_s=3)[-1]
-        radios = [
-            {k: r[k] for k in ("id", "chip", "bands_mhz", "tuned_mhz", "modulations", "features")}
-            for r in self.node.radios
-        ]
-        return {
-            "connected": True,
-            "node_id": self.node.node_id,
-            "fw": status["fw"],
-            "uptime_s": status["uptime_s"],
-            "radios": radios,
-            "monitor": self.monitor.status(),
-        }
+        pending = [n["node_id"] for n in self.store.nodes(state="pending")]
+        node = self.node
+        if node is None:
+            result: dict[str, Any] = {"connected": False, "error": self.node_error}
+        else:
+            with self._interactive():
+                status = node.request({"type": "status"}, timeout_s=3)[-1]
+            radios = [
+                {
+                    k: r[k]
+                    for k in ("id", "chip", "bands_mhz", "tuned_mhz", "modulations", "features")
+                }
+                for r in node.radios
+            ]
+            result = {
+                "connected": True,
+                "node_id": node.node_id,
+                "link": node.link,
+                "fw": status["fw"],
+                "uptime_s": status["uptime_s"],
+            }
+            result |= {k: status[k] for k in ("reset_reason", "wifi_rssi_dbm") if k in status}
+            result |= {"radios": radios, "monitor": self.monitor.status()}
+        if pending:
+            result["pending_approval"] = pending
+            result["approval_note"] = (
+                "These Wi-Fi nodes are waiting for the user to approve them on the bridge "
+                "computer: eter nodes approve <node_id>"
+            )
+        return result
 
     def require(self, feature: str) -> tuple[Node, Message]:
         """The connected node and its first radio with `feature`, or NodeError."""
-        if self.node is None:
+        node = self.node
+        if node is None:
             raise NodeError("NO_NODE", f"no node connected: {self.node_error}")
-        radio = self.node.radio_with(feature)
+        radio = node.radio_with(feature)
         if radio is None:
             raise NodeError("UNSUPPORTED", f"no connected radio supports {feature}")
-        return self.node, radio
+        return node, radio
 
     def scan(self, start_mhz: float, end_mhz: float, step_khz: float = 25) -> dict[str, Any]:
         node, radio = self.require("rssi_scan")
@@ -193,10 +244,10 @@ class Eter:
 
     def identify(self, freq_mhz: float) -> dict[str, Any]:
         result: dict[str, Any] = {"freq_mhz": freq_mhz, "likely_uses": bandplan.identify(freq_mhz)}
-        if self.node is not None:
+        if (node := self.node) is not None:
             result["receivable_by"] = [
                 r["id"]
-                for r in self.node.radios
+                for r in node.radios
                 if any(low <= freq_mhz <= high for low, high in r["bands_mhz"])
             ]
         return result
@@ -247,19 +298,28 @@ def _brief(kind: str, summary: dict[str, Any]) -> dict[str, Any]:
     return brief
 
 
-def open_eter() -> Eter:
-    """Connect using the environment: ETER_SIM (captures dir), ETER_PORT, ETER_DB."""
+def open_store() -> Store:
+    """The history database: ETER_DB, default ~/.eter/eter.db."""
     db = Path(os.environ.get("ETER_DB") or Path.home() / ".eter" / "eter.db")
     db.parent.mkdir(parents=True, exist_ok=True)
-    store = Store(db)
+    return Store(db)
+
+
+def open_eter(connect: bool = True) -> Eter:
+    """Connect using the environment: ETER_SIM (captures dir), ETER_PORT, ETER_DB. With
+    `connect=False`, start without a node and wait for Wi-Fi nodes to attach."""
+    store = open_store()
+    if not connect:
+        return Eter(None, store, node_error=WAITING_FOR_NODES)
     try:
         transport: Transport
+        link = "usb"
         if sim := os.environ.get("ETER_SIM"):
             from eter_sim import SimTransport
 
-            transport = SimTransport(Path(sim))
+            transport, link = SimTransport(Path(sim)), "sim"
         else:
             transport = SerialTransport(os.environ.get("ETER_PORT") or find_serial_port())
-        return Eter(Node(transport), store)
+        return Eter(Node(transport, link), store)
     except (OSError, NodeError) as error:
         return Eter(None, store, node_error=str(error))

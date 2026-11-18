@@ -1,7 +1,8 @@
-"""eter simulator: a virtual node that answers protocol v0 from recorded captures.
+"""eter simulator: a virtual node that answers the node protocol from recorded captures.
 
 Point it at a directory of capture files (docs/protocol.md §6). The first `hello` found becomes
 the node's identity; `scan` replays recorded spectra; `rx_pulses` replays recorded frames.
+`SimTransport` stands in for a USB link; `run_wifi_node` connects to a bridge like a Wi-Fi node.
 """
 
 import json
@@ -9,7 +10,10 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from websockets.asyncio.client import connect
+
 Message = dict[str, Any]
+PROTOCOL_V = 1
 SIM_NOISE_DBM = -100
 
 
@@ -33,7 +37,7 @@ class SimTransport:
 
     def write_line(self, line: str) -> None:
         request = json.loads(line)
-        base = {"v": 0, "re": request["id"]} if "id" in request else {"v": 0}
+        base = {"v": PROTOCOL_V, "re": request["id"]} if "id" in request else {"v": PROTOCOL_V}
         for reply in self._answer(request):
             self._out.append(json.dumps({**reply, **base}))
 
@@ -101,6 +105,29 @@ class SimTransport:
             "threshold_dbm": SIM_NOISE_DBM + 15,
         }
         return [*frames, done]
+
+
+async def run_wifi_node(url: str, captures_dir: Path, token_file: Path) -> None:
+    """Connect to a bridge (e.g. ws://127.0.0.1:8765/node) as a simulated Wi-Fi node and answer
+    until the connection closes. The pairing token is kept in `token_file`."""
+    sim = SimTransport(captures_dir)
+    assert sim.hello is not None
+    hello = {k: v for k, v in sim.hello.items() if k != "re"} | {"v": PROTOCOL_V}
+    if token_file.exists():
+        hello["token"] = token_file.read_text().strip()
+    async with connect(url) as ws:
+        await ws.send(json.dumps(hello))
+        async for text in ws:
+            request = json.loads(text)
+            if request.get("type") == "pair":
+                token_file.write_text(request["token"])
+                await ws.send(json.dumps({"v": PROTOCOL_V, "re": request["id"], "type": "paired"}))
+                continue
+            if request.get("type") == "error":
+                return  # rejected by the bridge
+            sim.write_line(str(text))
+            while (line := sim.read_line(0)) is not None:
+                await ws.send(line)
 
 
 def _error(code: str, msg: str) -> Message:

@@ -1,4 +1,4 @@
-# Node capabilities — v0
+# Node capabilities — v1
 
 Every node announces what it can do in the `capabilities` object of its `hello` message ([protocol.md](protocol.md)). The bridge only offers the AI tools that some connected node supports: no capability, no tool.
 
@@ -44,7 +44,7 @@ Every node announces what it can do in the `capabilities` object of its `hello` 
 
 ### `builtin[]`
 
-Non-radio-chip abilities of the node (e.g. `ble_scan`, `wifi_scan` on ESP32). Empty in v0.
+Non-radio-chip abilities of the node (e.g. `ble_scan`, `wifi_scan` on ESP32). Empty in v1.
 
 ## Reference node
 

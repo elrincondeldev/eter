@@ -1,11 +1,27 @@
 """MCP server: exposes eter_core to AI agents. Tools exist only if a connected node supports them."""
 
+import asyncio
+import functools
+import logging
+import os
+import weakref
+from collections.abc import Callable
 from typing import Annotated, Any
 
+import uvicorn
+from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.session import ServerSession
+from mcp.server.subscriptions import InMemorySubscriptionBus
+from mcp.shared.subscriptions import ToolsListChanged
 from pydantic import Field
 
-from eter_core import Eter, open_eter
+from eter_core import Eter, NodeError, open_eter
+from eter_core.nodeserver import NODE_PORT, NodeServer, advertise
+
+MCP_PORT = 8766
+log = logging.getLogger("eter.mcp")
 
 INSTRUCTIONS = """\
 eter connects you to radio hardware (a "node") near the user. Use it to explore the radio
@@ -17,7 +33,7 @@ spectrum, find active transmitters and explain what they probably are.
   typically used for.
 - Devices decoded by listen are remembered: list_devices shows them; label_device names the
   user's own ones. For frames no decoder recognised, analyze_capture shows pulse widths and bits.
-- monitor keeps listening in the background (e.g. preset sensors_433) while the session lasts;
+- monitor keeps listening in the background (e.g. preset sensors_433) while the bridge runs;
   what it decodes shows up in list_devices and query_events(kind="monitor").
 - Results are summaries, never raw samples. Units are in field names (freq_mhz, rssi_dbm).
 - RSSI: about -100 dBm is nothing, -40 dBm is very strong.
@@ -25,8 +41,40 @@ spectrum, find active transmitters and explain what they probably are.
 """
 
 
+def mcp_port() -> int:
+    return int(os.environ.get("ETER_MCP_PORT") or MCP_PORT)
+
+
+def _explained[Fn: Callable[..., Any]](fn: Fn) -> Fn:
+    """Let the AI read why a call failed (the SDK hides the text of unexpected exceptions)."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except NodeError as error:
+            raise ToolError(str(error)) from error
+
+    return wrapper  # type: ignore[return-value]
+
+
+class _Sessions:
+    """Remembers connected clients, to tell them when the tool list grows."""
+
+    def __init__(self) -> None:
+        self.sessions: weakref.WeakSet[ServerSession] = weakref.WeakSet()
+
+    async def __call__(
+        self, ctx: ServerRequestContext[Any, Any], call_next: CallNext
+    ) -> HandlerResult:
+        self.sessions.add(ctx.session)
+        return await call_next(ctx)
+
+
 def build_server(eter: Eter) -> MCPServer:
-    server = MCPServer("eter", instructions=INSTRUCTIONS)
+    bus = InMemorySubscriptionBus()
+    clients = _Sessions()
+    server = MCPServer("eter", instructions=INSTRUCTIONS, subscriptions=bus, middleware=[clients])
 
     def node_status() -> dict[str, Any]:
         """Show the connected radio node: identity, firmware, uptime, and each radio's frequency
@@ -111,26 +159,60 @@ def build_server(eter: Eter) -> MCPServer:
         ] = "sensors_433",
         enabled: Annotated[bool, Field(description="true to start, false to stop")] = True,
     ) -> dict[str, Any]:
-        """Start or stop background listening. While it runs (only as long as this session), the
+        """Start or stop background listening. While it runs (as long as the bridge does), the
         node listens in 5 s chunks and decoded devices are recorded; your own scan or listen
         requests go first and wait at most one chunk. Returns the monitor status: chunks, frames
         and devices seen so far. node_status also reports it."""
         return eter.set_monitor(preset, enabled)
 
-    server.add_tool(node_status)
-    server.add_tool(identify_frequency)
-    server.add_tool(query_events)
-    server.add_tool(list_devices)
-    server.add_tool(label_device)
-    features = eter.features()
-    if "rssi_scan" in features:
-        server.add_tool(scan_spectrum)
-    if "rx_pulses" in features:
-        server.add_tool(listen)
-        server.add_tool(analyze_capture)
-        server.add_tool(monitor)
+    for tool in (node_status, identify_frequency, query_events, list_devices, label_device):
+        server.add_tool(_explained(tool))
+    by_feature: dict[str, list[Callable[..., Any]]] = {
+        "rssi_scan": [scan_spectrum],
+        "rx_pulses": [listen, analyze_capture, monitor],
+    }
+    added: set[str] = set()
+
+    def add_capability_tools() -> bool:
+        """Add the tools of newly seen features. Tools stay when a node drops: it usually comes
+        back, and meanwhile they explain that no node is connected."""
+        new = eter.features() & by_feature.keys() - added
+        for feature in sorted(new):
+            for tool in by_feature[feature]:
+                server.add_tool(_explained(tool))
+            added.add(feature)
+        return bool(new)
+
+    async def notify() -> None:
+        await bus.publish(ToolsListChanged())
+        for session in list(clients.sessions):
+            try:
+                await session.send_tool_list_changed()
+            except Exception:  # a client that went away
+                log.debug("could not notify a client", exc_info=True)
+
+    def on_nodes_changed() -> None:
+        if add_capability_tools():
+            try:
+                asyncio.get_running_loop().create_task(notify())
+            except RuntimeError:
+                pass  # not serving yet: clients will list the tools when they connect
+
+    add_capability_tools()
+    eter.on_nodes_changed.append(on_nodes_changed)
     return server
 
 
+async def serve(eter: Eter, node_port: int = NODE_PORT, port: int = MCP_PORT) -> None:
+    """The bridge daemon: Wi-Fi nodes connect on all interfaces at `node_port`; the MCP server
+    listens only on this computer, at http://127.0.0.1:<port>/mcp."""
+    app = build_server(eter).streamable_http_app(host="127.0.0.1")
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    log.info("MCP server on http://127.0.0.1:%d/mcp", port)
+    async with advertise(node_port):
+        await asyncio.gather(NodeServer(eter, port=node_port).run(), uvicorn.Server(config).serve())
+
+
 def main() -> None:
+    """MCP over stdio, with the node opened directly (USB or ETER_SIM), without the daemon."""
     build_server(open_eter()).run()

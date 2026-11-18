@@ -4,11 +4,38 @@ An open-source harness that gives AI agents access to the radio spectrum through
 
 A **node** (reference: ESP32-S3 + CC1101 433 MHz) captures signals. A **bridge** (Python) decodes and stores them and exposes them through MCP, a CLI, a library and an optional REST API.
 
-> Status: pre-development. Phase 4 (decoding) done: rtl_433 decoding, devices, pulse analysis and background monitoring, checked on the reference node. Next is Phase 5 (Wi-Fi, BLE and running 24/7).
+> Status: pre-development. Phase 4 (decoding) done: rtl_433 decoding, devices, pulse analysis and background monitoring, checked on the reference node. Phase 5 (Wi-Fi, BLE and running 24/7) in progress: nodes connect over Wi-Fi.
+
+## Run the bridge
+
+The bridge is a program on your computer that owns the nodes. Start it and leave it running:
+
+```
+uv run --directory bridge eter serve          # Wi-Fi nodes only
+uv run --directory bridge eter serve --usb    # also the node plugged in over USB
+```
+
+Nodes connect to it over Wi-Fi (port 8765; it announces itself on the local network as `_eter._tcp`, so nodes find it). Claude Code and the CLI talk to it at `http://127.0.0.1:8766/mcp`, which only this computer can reach. macOS may ask whether Python can accept incoming connections: allow it, or Wi-Fi nodes cannot connect.
+
+### Put a node on Wi-Fi
+
+1. Flash the firmware and power the node. With no Wi-Fi saved, it opens a Wi-Fi network called `eter-xxxxxx` for 10 minutes.
+2. Join that network from your phone. A setup page opens (if not, browse to `192.168.4.1`). Choose your Wi-Fi network and enter its password. Leave *Bridge address* empty unless mDNS does not work on your network; in that case enter the computer's IP.
+3. The node joins your Wi-Fi and connects to the bridge. The first time, it waits for your approval:
+
+```
+uv run --directory bridge eter nodes                        # nodes and their state
+uv run --directory bridge eter nodes approve esp32s3-xxxxxx # pair it
+uv run --directory bridge eter nodes forget esp32s3-xxxxxx  # unpair it
+```
+
+Approving gives the node a secret token, which it keeps. From then on it reconnects by itself after a Wi-Fi drop, a bridge restart or a reboot. Unapproved nodes are ignored.
+
+To start over, hold the node's **BOOT** button for 3 seconds: it erases Wi-Fi, bridge address and token, and opens the setup network again.
 
 ## Use it from Claude Code
 
-The repo's `.mcp.json` registers the `eter` MCP server. Open Claude Code in the repo root, approve the `eter` server, and ask things like *"what is on the air between 430 and 440 MHz?"*.
+The repo's `.mcp.json` points Claude Code at the running bridge (`eter serve`). Open Claude Code in the repo root, approve the `eter` server, and ask things like *"what is on the air between 430 and 440 MHz?"*. The tools that need a radio appear once a node with that radio has connected.
 
 | Tool | What it does | Needs |
 |---|---|---|
@@ -20,11 +47,11 @@ The repo's `.mcp.json` registers the `eter` MCP server. Open Claude Code in the 
 | `analyze_capture` | Pulse widths, modulation guess and bits of an earlier listen | a radio with `rx_pulses` |
 | `list_devices` | Devices decoded so far, with their last data | — |
 | `label_device` | Name a device and mark it as yours | — |
-| `monitor` | Keep listening in the background (preset `sensors_433`) while the session lasts | a radio with `rx_pulses` |
+| `monitor` | Keep listening in the background (preset `sensors_433`) while the bridge runs | a radio with `rx_pulses` |
 
 Decoding uses [rtl_433](https://github.com/merbanan/rtl_433) as an external program (macOS: `brew install rtl_433`). Without it, `listen` still captures frames but cannot name them.
 
-The same operations are available as a CLI that prints JSON:
+The same operations are available as a CLI that prints JSON. When `eter serve` is running, the CLI goes through it; otherwise it opens the USB node itself:
 
 ```
 uv run --directory bridge eter status
@@ -44,9 +71,12 @@ Configuration (environment variables):
 |---|---|---|
 | `ETER_PORT` | the only `/dev/*usbmodem*` / `ttyACM*` | Serial port of the node |
 | `ETER_SIM` | — | Use the simulator with this captures directory instead of hardware (absolute path, e.g. `$PWD/captures`) |
-| `ETER_DB` | `~/.eter/eter.db` | SQLite history |
+| `ETER_DB` | `~/.eter/eter.db` | SQLite history and paired nodes |
+| `ETER_MCP_PORT` | `8766` | Port of the bridge's MCP server (on 127.0.0.1) |
 
-Only one program can use the node's USB port at a time: close the serial monitor and `node_probe.py` before using the MCP server or the CLI.
+Only one program can use the node's USB port at a time: close the serial monitor and `node_probe.py` before using `eter serve --usb` or the CLI over USB.
+
+Without hardware, a simulated node can join a running bridge over Wi-Fi the same way: `uv run --directory bridge python -m eter_sim --captures $PWD/captures`.
 
 ## Try the node directly
 
