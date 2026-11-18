@@ -7,6 +7,8 @@ dependencies = [
     "mcp>=2.3.0,<3",
     "pyserial>=3.5",
     "typer>=0.29.1",
+    "websockets>=17.4",
+    "zeroconf>=0.154.0",
 ]
 
 [project.scripts]

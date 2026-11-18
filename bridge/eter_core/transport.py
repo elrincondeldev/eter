@@ -1,7 +1,10 @@
-"""Links to a node. Every transport carries NDJSON lines (docs/protocol.md §1)."""
+"""Links to a node. Every transport carries one JSON message per line (docs/protocol.md §1)."""
 
+import asyncio
+import queue
 import time
-from typing import Protocol
+from collections.abc import Callable, Coroutine
+from typing import Any, Protocol
 
 import serial
 from serial.tools import list_ports
@@ -11,7 +14,8 @@ class Transport(Protocol):
     def write_line(self, line: str) -> None: ...
 
     def read_line(self, timeout_s: float) -> str | None:
-        """Next complete line without the newline, or None if none arrived in time."""
+        """Next complete line without the newline, or None if none arrived in time.
+        Raises OSError (e.g. ConnectionError) once the link is lost."""
         ...
 
 
@@ -36,6 +40,48 @@ class SerialTransport:
             self._buffer += self._serial.readline()
         line, self._buffer = self._buffer, b""
         return line.decode(errors="replace").strip()
+
+
+class WebSocketTransport:
+    """WebSocket link to a node that connected to the bridge (the node is the client).
+
+    The connection lives on an asyncio loop while Node calls come from worker threads: the
+    server's receive loop feeds incoming messages in, and writes are scheduled on the loop.
+    """
+
+    def __init__(
+        self, loop: asyncio.AbstractEventLoop, send: Callable[[str], Coroutine[Any, Any, None]]
+    ) -> None:
+        self._loop = loop
+        self._send = send
+        self._inbox: queue.Queue[str | None] = queue.Queue()
+        self._closed = False
+
+    def feed(self, message: str) -> None:
+        self._inbox.put(message)
+
+    def close(self) -> None:
+        self._closed = True
+        self._inbox.put(None)
+
+    def write_line(self, line: str) -> None:
+        if self._closed:
+            raise ConnectionError("the node disconnected")
+        future = asyncio.run_coroutine_threadsafe(self._send(line), self._loop)
+        try:
+            future.result(timeout=10)
+        except Exception as error:
+            raise ConnectionError(f"the node disconnected ({error})") from error
+
+    def read_line(self, timeout_s: float) -> str | None:
+        try:
+            line = self._inbox.get(timeout=max(timeout_s, 0))
+        except queue.Empty:
+            return None
+        if line is None:
+            self._inbox.put(None)  # keep reporting the closed link
+            raise ConnectionError("the node disconnected")
+        return line
 
 
 def find_serial_port() -> str:

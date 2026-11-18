@@ -1,25 +1,41 @@
-// eter reference node: node protocol v0 over USB serial (docs/protocol.md).
+// eter reference node: node protocol v1 over USB serial and Wi-Fi (docs/protocol.md).
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <esp_system.h>
+#include <esp_task_wdt.h>
 
+#include "net.h"
 #include "radio.h"
+#include "transport.h"
 
-constexpr const char* FW_VERSION = "0.1.0";
-constexpr int PROTOCOL_V = 0;
+using transport::Channel;
+
+constexpr const char* FW_VERSION = "0.2.0";
+constexpr int PROTOCOL_V = 1;
 constexpr const char* RADIO_ID = "r433";
-constexpr size_t MAX_LINE = 512;
 constexpr int MAX_POINTS = 1001;
+// Restart if the main loop hangs this long. Long commands (rx_pulses: up to 60 s) feed the
+// watchdog while they run.
+constexpr uint32_t WATCHDOG_S = 30;
 
 char node_id[16];
 bool radio_ok = false;
-char line[MAX_LINE + 1];
-size_t line_len = 0;
-bool line_overflow = false;
 int16_t spectrum[MAX_POINTS];
+// Link the command being handled came from: its replies go back there.
+Channel reply_to = Channel::USB;
 
-void send(const JsonDocument& doc) {
-  serializeJson(doc, Serial);
-  Serial.print('\n');
+void sendTo(Channel to, const JsonDocument& doc) {
+  String text;
+  serializeJson(doc, text);
+  transport::send(to, text);
+}
+
+void send(const JsonDocument& doc) { sendTo(reply_to, doc); }
+
+// Unsolicited messages go to USB and, when connected, to the bridge.
+void broadcast(const JsonDocument& doc) {
+  sendTo(Channel::USB, doc);
+  if (transport::wsConnected()) sendTo(Channel::WS, doc);
 }
 
 // Message skeleton: {"v":0, "re":<id>, "type":...}. "re" only when the request had an "id".
@@ -42,13 +58,18 @@ void sendLog(const char* level, const String& msg) {
   JsonDocument doc = message("log", JsonVariantConst());
   doc["level"] = level;
   doc["msg"] = msg;
-  send(doc);
+  broadcast(doc);
 }
 
-void sendHello(JsonVariantConst id) {
+// The pairing token only ever travels over the WebSocket (docs/protocol.md §1.2).
+void sendHello(Channel to, JsonVariantConst id) {
   JsonDocument doc = message("hello", id);
   doc["node_id"] = node_id;
   doc["fw"] = FW_VERSION;
+  if (to == Channel::WS) {
+    String token = net::token();
+    if (!token.isEmpty()) doc["token"] = token;
+  }
   JsonObject caps = doc["capabilities"].to<JsonObject>();
   JsonArray radios = caps["radios"].to<JsonArray>();
   if (radio_ok) {
@@ -67,7 +88,26 @@ void sendHello(JsonVariantConst id) {
     features.add("rx_pulses");
   }
   caps["builtin"].to<JsonArray>();
-  send(doc);
+  sendTo(to, doc);
+}
+
+const char* resetReason() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:
+      return "poweron";
+    case ESP_RST_SW:
+      return "software";
+    case ESP_RST_PANIC:
+      return "panic";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:
+      return "watchdog";
+    case ESP_RST_BROWNOUT:
+      return "brownout";
+    default:
+      return "other";
+  }
 }
 
 void handleStatus(JsonVariantConst id) {
@@ -77,7 +117,33 @@ void handleStatus(JsonVariantConst id) {
   doc["heap_free"] = ESP.getFreeHeap();
   JsonArray radios = doc["radios"].to<JsonArray>();
   if (radio_ok) radios.add(RADIO_ID);
+  doc["reset_reason"] = resetReason();
+  int wifi_rssi;
+  if (net::wifiRssi(wifi_rssi)) doc["wifi_rssi_dbm"] = wifi_rssi;
   send(doc);
+}
+
+bool isToken(const char* token) {
+  if (strlen(token) != 32) return false;
+  for (const char* c = token; *c; c++) {
+    if (!isdigit(*c) && (*c < 'a' || *c > 'f')) return false;
+  }
+  return true;
+}
+
+void handlePair(const JsonDocument& req, JsonVariantConst id) {
+  if (reply_to != Channel::WS) {
+    sendError(id, "UNSUPPORTED", "pair is only accepted from the bridge over Wi-Fi");
+    return;
+  }
+  const char* token = req["token"] | "";
+  if (!isToken(token)) {
+    sendError(id, "INVALID", "token must be 32 lowercase hex characters");
+    return;
+  }
+  net::setToken(token);
+  sendLog("info", "paired with the bridge");
+  send(message("paired", id));
 }
 
 bool inBand(float mhz) { return mhz >= radio::BAND_MIN_MHZ && mhz <= radio::BAND_MAX_MHZ; }
@@ -184,7 +250,7 @@ void handleRxPulses(const JsonDocument& req, JsonVariantConst id) {
   send(doc);
 }
 
-void handleLine(const char* text) {
+void handleMessage(const char* text) {
   JsonDocument req;
   if (deserializeJson(req, text) != DeserializationError::Ok || !req.is<JsonObject>()) {
     sendError(JsonVariantConst(), "INVALID", "not a JSON object");
@@ -198,7 +264,9 @@ void handleLine(const char* text) {
   }
   const char* type = req["type"] | "";
   if (strcmp(type, "hello") == 0) {
-    sendHello(id);
+    sendHello(reply_to, id);
+  } else if (strcmp(type, "pair") == 0) {
+    handlePair(req, id);
   } else if (strcmp(type, "status") == 0) {
     handleStatus(id);
   } else if (strcmp(type, "scan") == 0) {
@@ -212,6 +280,9 @@ void handleLine(const char* text) {
 
 void setup() {
   Serial.begin(115200);
+  transport::begin();
+  esp_task_wdt_init(WATCHDOG_S, true);
+  esp_task_wdt_add(nullptr);
 
   // node_id from the last 3 bytes of the factory MAC address.
   uint64_t mac = ESP.getEfuseMac();
@@ -227,27 +298,27 @@ void setup() {
     sendLog("error", String("CC1101 not available (VERSION=0x") + String(version, HEX) +
                          ", RadioLib " + state + "): check VCC, GND and the SPI wires");
   }
-  sendHello(JsonVariantConst());
+  sendHello(Channel::USB, JsonVariantConst());
+  net::begin(node_id, sendLog);
 }
 
 void loop() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n') {
-      if (line_overflow) {
-        sendError(JsonVariantConst(), "INVALID", "line too long (max 512 bytes)");
-      } else {
-        line[line_len] = '\0';
-        if (line_len > 0) handleLine(line);
-      }
-      line_len = 0;
-      line_overflow = false;
-    } else if (c == '\r') {
-      continue;
-    } else if (line_len < MAX_LINE) {
-      line[line_len++] = c;
-    } else {
-      line_overflow = true;
-    }
+  esp_task_wdt_reset();
+  net::loop();
+  if (transport::takeWsConnected()) {
+    sendHello(Channel::WS, JsonVariantConst());  // must be the first message (protocol §1.1)
+    sendLog("info", net::token().isEmpty()
+                        ? String("connected to the bridge; if this node is new, approve it "
+                                 "there: eter nodes approve ") + node_id
+                        : String("connected to the bridge"));
   }
+  transport::Message msg;
+  if (!transport::poll(msg)) return;
+  reply_to = msg.from;
+  if (msg.overflow) {
+    sendError(JsonVariantConst(), "INVALID", "message too long (max 512 bytes)");
+  } else {
+    handleMessage(msg.text);
+  }
+  reply_to = Channel::USB;
 }

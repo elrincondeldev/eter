@@ -15,6 +15,9 @@ if TYPE_CHECKING:
     from eter_core.eter import Eter
 
 CHUNK_S = 5
+# The node may come back (Wi-Fi drop, reboot): keep trying instead of giving up.
+RETRY_CODES = {"DISCONNECTED", "NO_NODE", "TIMEOUT"}
+RETRY_S = 5
 PRESETS: dict[str, dict[str, Any]] = {
     "sensors_433": {
         "freq_mhz": 433.92,
@@ -85,7 +88,11 @@ class Monitor:
                 result = self._eter.capture(freq_mhz, CHUNK_S, None, kind="monitor")
             except NodeError as error:
                 self._error = str(error)
-                return
+                if error.code not in RETRY_CODES:
+                    return
+                self._stop.wait(RETRY_S)
+                continue
+            self._error = None
             self._chunks += 1
             self._frames += result["frames"]
             self._devices.update(d["device"] for d in result["devices"])
